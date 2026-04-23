@@ -1,0 +1,307 @@
+import os 
+from dotenv import load_dotenv
+from telegram import Update 
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.error import TimedOut, RetryAfter, BadRequest
+import re 
+from datetime import datetime, timezone, timedelta, date
+import asyncio
+import json
+
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+
+SGT = timezone(timedelta(hours=8))
+algaemart_chat_id = -1002140410161 
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+
+## reset winners.json on startup
+with open("winners.json", "w") as f:
+    json.dump({"winners": [], "messaged_users": {}}, f, indent=2)
+
+auctions = {}
+
+# ── Helpers ──
+
+async def safe_send_message(bot, **kwargs):
+    for attempt in range(3):
+        try:
+            await bot.send_message(**kwargs)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TimedOut:
+            await asyncio.sleep((attempt + 1) * 3)
+        except BadRequest as e:
+            print(f"BadRequest send_message (skipping): {e}")
+            return
+        except Exception as e:
+            print(f"send_message failed: {e}")
+            return
+
+async def safe_edit_caption(bot, chat_id, message_id, caption):
+    """Edit the caption on the first photo of the media group directly."""
+    for attempt in range(3):
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=caption
+            )
+            return True
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TimedOut:
+            await asyncio.sleep((attempt + 1) * 3)
+        except BadRequest as e:
+            print(f"Caption edit BadRequest: {e}")
+            return False
+        except Exception as e:
+            print(f"Caption edit failed: {e}")
+            return False
+    return False
+
+def get_sb_price(caption):
+    for line in (caption or '').split("\n"):
+        if line.lower().startswith("sb"):
+            price = re.sub(r"[^\d.]", "", line)
+            if price:
+                return int(float(price))
+    return 2
+
+def get_current_bid(caption):
+    for line in (caption or '').split("\n"):
+        if line.startswith("@"):
+            price = re.sub(r"[^\d.]", "", line)
+            if price:
+                return int(float(price))
+    return 0
+
+def get_current_bidder(caption):
+    for line in (caption or '').split("\n"):
+        if line.startswith("@"):
+            match = re.search(r'@(\w+)', line)
+            if match:
+                return match.group(1)
+    return None
+
+def is_past_9pm():
+    now = datetime.now(SGT)
+    return now.date() == (2026, 4, 22) and now.hour >= 21
+
+def both_conditions_met(auction):
+    if not is_past_9pm():
+        return False
+    if auction["last_bid_time"] is None:
+        return True
+    now = datetime.now(SGT)
+    last_bid_time = auction["last_bid_time"]
+    if last_bid_time.tzinfo is None:
+        last_bid_time = last_bid_time.replace(tzinfo=timezone.utc)
+    minutes_since_last_bid = (now - last_bid_time).total_seconds() / 60
+    return minutes_since_last_bid >= 5
+
+# ── Auction close ──
+
+async def close_auction(post_id, context):
+    auction = auctions[post_id]
+    auction["closed"] = True
+    content = auction["last_caption"]
+
+    if auction["highest_bidder"] is None:
+        sb_price = get_sb_price(content)
+        new_caption = content + f"\n\nAVAIL FCFS @ ${sb_price} # algaeavail"
+        await safe_edit_caption(context.bot, algaemart_chat_id, post_id, new_caption)
+        return
+
+    await safe_send_message(
+        context.bot,
+        chat_id=auction["discussion_chat_id"],
+        text=f"Auction closed! Congratulations @{auction['highest_bidder']}, you won at ${auction['highest_bid']}! We'll be in touch shortly.",
+        reply_to_message_id=auction["highest_bidder_message_id"]
+    )
+
+    new_caption = content.replace(
+        auction["last_at_line"],
+        f"[CLOSED] final bid: ${auction['highest_bid']} for @{auction['highest_bidder']}"
+    )
+    new_lines = [line for line in new_caption.split("\n") if "EXTENDED TO" not in line]
+    new_caption = "\n".join(new_lines)
+
+    await safe_edit_caption(context.bot, algaemart_chat_id, post_id, new_caption)
+
+# ── Periodic checker ──
+
+async def check_auctions(context):
+    for post_id, auction in list(auctions.items()):
+        if auction.get("closed"):
+            continue
+        if both_conditions_met(auction):
+            await close_auction(post_id, context)
+        elif is_past_9pm() and auction["last_bid_time"] is not None and not auction.get("extension_noted"):
+            last_bid_time = auction["last_bid_time"]
+            if last_bid_time.tzinfo is None:
+                last_bid_time = last_bid_time.replace(tzinfo=timezone.utc)
+            close_time = last_bid_time + timedelta(minutes=5)
+            close_time_sgt = close_time.astimezone(SGT)
+            close_str = close_time_sgt.strftime("%I.%M%p").lower().lstrip("0")
+
+            content = auction["last_caption"]
+            lines = content.split("\n")
+            extended_line = f"EXTENDED TO {close_str}"
+
+            if any("EXTENDED TO" in line for line in lines):
+                new_lines = [extended_line if "EXTENDED TO" in line else line for line in lines]
+            else:
+                new_lines = lines + [extended_line]
+
+            new_caption = "\n".join(new_lines)
+            auction["last_caption"] = new_caption
+            auction["extension_noted"] = True
+
+            await safe_edit_caption(context.bot, algaemart_chat_id, post_id, new_caption)
+
+# ── Main message handler ──
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.text:
+        return
+    if not message.reply_to_message:
+        return
+
+    # Resolve which listing post this bid belongs to
+    if message.reply_to_message.forward_origin:
+        post_id = message.reply_to_message.forward_origin.message_id
+        original_caption = message.reply_to_message.caption or message.reply_to_message.text
+    elif message.message_thread_id:
+        post_id = None
+        for pid, auc in auctions.items():
+            if auc.get("thread_id") == message.message_thread_id:
+                post_id = pid
+                break
+        if post_id is None:
+            return
+        original_caption = auctions[post_id]["last_caption"]
+    else:
+        return
+
+    # Initialise auction state from caption on first encounter
+    if post_id not in auctions:
+        current_bid    = get_current_bid(original_caption)
+        current_bidder = get_current_bidder(original_caption)
+        auctions[post_id] = {
+            "highest_bid":               current_bid,
+            "highest_bidder":            current_bidder,
+            "highest_bidder_id":         None,
+            "highest_bidder_message_id": None,
+            "last_bid_time":             None,
+            "discussion_chat_id":        message.chat_id,
+            "thread_id":                 message.message_thread_id,
+            "last_caption":              original_caption,
+            "last_at_line":              f"@ ${current_bid}" if current_bid > 0 else None,
+            "closed":                    False,
+            "extension_noted":           False,
+        }
+
+    auction = auctions[post_id]
+
+    if auction.get("closed"):
+        await safe_send_message(
+            context.bot,
+            chat_id=message.chat_id,
+            text="This auction is closed! No more bids are being accepted.",
+            reply_to_message_id=message.message_id
+        )
+        return
+
+    # Parse bid
+    text = message.text.strip().lower()
+    if text == "sb":
+        bid = get_sb_price(original_caption)
+    else:
+        clean = re.sub(r"[^\d.]", "", text)
+        try:
+            bid = int(float(clean))
+        except ValueError:
+            return
+
+    sb_price = get_sb_price(original_caption)
+
+    if auction["highest_bid"] == 0 and bid < sb_price:
+        await safe_send_message(
+            context.bot,
+            chat_id=message.chat_id,
+            text=f"Bidding starts at ${sb_price}!",
+            reply_to_message_id=message.message_id
+        )
+        return
+
+    if bid >= auction["highest_bid"] + 2 or (auction["highest_bid"] == 0 and bid >= sb_price):
+        previous_bidder_id         = auction["highest_bidder_id"]
+        previous_bidder_message_id = auction["highest_bidder_message_id"]
+
+        auction["highest_bid"]               = bid
+        auction["highest_bidder"]            = message.from_user.username
+        auction["highest_bidder_id"]         = message.from_user.id
+        auction["highest_bidder_message_id"] = message.message_id
+        auction["last_bid_time"]             = message.date
+        auction["extension_noted"]           = False
+
+        if previous_bidder_id and previous_bidder_message_id:
+            await safe_send_message(
+                context.bot,
+                chat_id=message.chat_id,
+                text=f"You've been outbid! New highest bid: ${auction['highest_bid']} from @{auction['highest_bidder']}",
+                reply_to_message_id=previous_bidder_message_id
+            )
+
+        # Update caption on the channel post
+        content = auction["last_caption"]
+        lines   = content.split("\n")
+        at_line = f"@ ${auction['highest_bid']}"
+
+        if any(line.startswith("@") for line in lines):
+            new_lines = [at_line if line.startswith("@") else line for line in lines]
+        else:
+            new_lines = lines + [f"\n{at_line}"]
+
+        new_caption             = "\n".join(new_lines)
+        auction["last_caption"] = new_caption
+        auction["last_at_line"] = at_line
+
+        await safe_edit_caption(context.bot, algaemart_chat_id, post_id, new_caption)
+
+    elif bid <= auction["highest_bid"]:
+        await safe_send_message(
+            context.bot,
+            chat_id=message.chat_id,
+            text=f"Your bid is too low! Current highest bid is ${auction['highest_bid']}. You may also check the caption for the highest bid!",
+            reply_to_message_id=message.message_id
+        )
+
+    elif bid < auction["highest_bid"] + 2:
+        await safe_send_message(
+            context.bot,
+            chat_id=message.chat_id,
+            text=f"Minimum increment is $2! Current highest bid is ${auction['highest_bid']}.",
+            reply_to_message_id=message.message_id
+        )
+
+# ── Startup ──
+
+async def post_init(app):
+    asyncio.create_task(asyncio.sleep(0))  # no background workers needed
+
+app = (
+    ApplicationBuilder()
+    .token(TOKEN)
+    .post_init(post_init)
+    .build()
+)
+
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app.job_queue.run_repeating(check_auctions, interval=30, first=10)
+
+print("AlgaeBot is running...")
+app.run_polling(drop_pending_updates=True)
